@@ -1,0 +1,47 @@
+name: "AI Model Deprecation Check"
+description: "Fail CI when your code references AI models that are shut down or about to be. Zero secrets, zero dependencies, code never leaves the runner."
+author: "AI Flash Report"
+
+branding:
+  icon: "alert-triangle"
+  color: "orange"
+
+inputs:
+  warn-days:
+    description: "Fail if a matched model shuts down within this many days. Announced deprecations beyond the window produce warnings only."
+    required: false
+    default: "90"
+  fail-on:
+    description: "When to fail the check: 'expiring' (default: shut-down models plus models shutting down within warn-days), 'shutdown' (only models already shut down), or 'never' (annotations only)."
+    required: false
+    default: "expiring"
+  paths:
+    description: "Comma- or newline-separated glob patterns (e.g. 'src/**,config/*.yaml'). When set, only matching files are scanned. Default: the whole checkout."
+    required: false
+    default: ""
+  ignore-models:
+    description: "Comma- or newline-separated model IDs or slugs to skip (e.g. 'gpt-4-0314,dall-e-2')."
+    required: false
+    default: ""
+  deprecations-url:
+    description: "Override the deprecations dataset source (public URL or local file path). Mainly for testing or pinning."
+    required: false
+    default: "https://aiflashreport.com/data/deprecations.json"
+  releases-url:
+    description: "Override the model releases dataset used for slug aliasing (public URL or local file path)."
+    required: false
+    default: "https://aiflashreport.com/data/model_releases.json"
+
+outputs:
+  shutdown-count:
+    description: "Number of matched models that are already shut down."
+  expiring-count:
+    description: "Number of matched models shutting down within warn-days."
+  announced-count:
+    description: "Number of matched models with an announced deprecation beyond the warn window."
+  matches:
+    description: "JSON array of all matches with provider, status, shutdown date, replacement, source URL, and file locations."
+
+runs:
+  using: "node20"
+  main: "dist/index.js"

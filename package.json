@@ -1,0 +1,15 @@
+{
+  "name": "ai-model-deprecation-check",
+  "version": "1.0.0",
+  "private": true,
+  "description": "GitHub Action that fails CI when your code references AI models that are shut down or about to be.",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node tests/run.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}

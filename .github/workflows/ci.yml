@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Verify committed dist/ matches src/
+        run: |
+          node scripts/build.mjs
+          git diff --exit-code dist/
+
+      - name: Run test suite (shutdown hit, warn-window hit, clean run)
+        run: node tests/run.js
+
+      - name: Live dataset smoke test
+        run: |
+          node --input-type=module -e '
+            const urls = [
+              "https://aiflashreport.com/data/deprecations.json",
+              "https://aiflashreport.com/data/model_releases.json",
+            ];
+            for (const url of urls) {
+              const data = await (await fetch(url)).json();
+              if (!Array.isArray(data) || data.length === 0) {
+                throw new Error("Unexpected dataset shape: " + url);
+              }
+              console.log(url, "->", data.length, "rows");
+            }
+          '
+
+  self-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Real invocation against the live dataset. Annotation-only mode because
+      # this repo's fixtures and docs intentionally contain deprecated model
+      # IDs; the step proves the action runs end to end on a real checkout.
+      - name: Run the action on this repository (annotate only)
+        id: depcheck
+        uses: ./
+        with:
+          fail-on: never
+
+      - name: Show outputs
+        run: |
+          echo "shutdown-count=${{ steps.depcheck.outputs.shutdown-count }}"
+          echo "expiring-count=${{ steps.depcheck.outputs.expiring-count }}"
+          echo "announced-count=${{ steps.depcheck.outputs.announced-count }}"
+
+      # A scan scoped to files with no model IDs must pass in enforcing mode.
+      - name: Enforcing run on a clean subset
+        uses: ./
+        with:
+          paths: "scripts/**,LICENSE,.github/**"

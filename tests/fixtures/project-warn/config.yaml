@@ -1,0 +1,4 @@
+llm:
+  primary_model: gemini-1.5-pro-002
+  fallback_model: claude-3-opus-20240229
+  temperature: 0.1
