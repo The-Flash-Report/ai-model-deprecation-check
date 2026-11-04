@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildReleasesIndex, parseCliArgs, replacementText } from "../dist/index.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entry = path.join(root, "dist", "index.js");
@@ -192,6 +193,121 @@ check("paths input restricts the scan", () => {
   assert.equal(r.code, 1);
   assert.doesNotMatch(r.stdout, /app\.py/);
   assert.match(r.stdout, /notes\.md/);
+});
+
+check("parseCliArgs parses space-separated, equals-separated, and boolean flags", () => {
+  const parsed = parseCliArgs([
+    "--warn-days",
+    "60",
+    "--fail-on=shutdown",
+    "--ignore-models",
+    "gpt-4-0314,dall-e-2",
+    "--paths=src/**,config/**",
+    "--json",
+  ]);
+  assert.equal(parsed.warnDays, "60");
+  assert.equal(parsed.failOn, "shutdown");
+  assert.equal(parsed.ignoreModels, "gpt-4-0314,dall-e-2");
+  assert.equal(parsed.paths, "src/**,config/**");
+  assert.equal(parsed.format, "json");
+
+  const helpParsed = parseCliArgs(["--help"]);
+  assert.equal(helpParsed.help, true);
+
+  const sarifParsed = parseCliArgs(["--sarif", "--root", "/tmp/repo"]);
+  assert.equal(sarifParsed.format, "sarif");
+  assert.equal(sarifParsed.root, "/tmp/repo");
+});
+
+check("replacementText enriches replacement with pricing delta and context window when available", () => {
+  const enrichedReleases = buildReleasesIndex([
+    {
+      slug: "openai-gpt-4-0314",
+      name: "gpt-4-0314",
+      pricing: { input_per_mtok: { value: "$30.00" }, output_per_mtok: "$60.00" },
+      context_window: { value: "8K tokens" },
+    },
+    {
+      slug: "openai-gpt-5",
+      name: "gpt-5",
+      pricing: { input_per_mtok: "$2.50", output_per_mtok: "$12.00" },
+      context_window: "400K tokens",
+    },
+  ]);
+  const text = replacementText(deprecations[0], enrichedReleases);
+  assert.match(text, /replacement: gpt-5 \(https:\/\/aiflashreport\.com\/models\/openai-gpt-5\/\)/);
+  assert.match(text, /pricing: \$30\.00\/\$60\.00 -> \$2\.50\/\$12\.00 per 1M in\/out/);
+  assert.match(text, /context: 400K tokens/);
+});
+
+check("CLI --help prints usage and exits 0", () => {
+  const res = spawnSync(process.execPath, [entry, "--help"], { encoding: "utf8" });
+  assert.equal(res.status, 0);
+  assert.match(res.stdout, /Usage: ai-model-deprecation-check \[options\]/);
+  assert.match(res.stdout, /--warn-days <days>/);
+  assert.match(res.stdout, /--json/);
+  assert.match(res.stdout, /--sarif/);
+});
+
+check("CLI --json outputs structured JSON report and sets exit code", () => {
+  const res = spawnSync(
+    process.execPath,
+    [
+      entry,
+      "--json",
+      "--deprecations-url",
+      depPath,
+      "--releases-url",
+      relPath,
+    ],
+    {
+      cwd: path.join(fixtures, "project-shutdown"),
+      env: { PATH: process.env.PATH },
+      encoding: "utf8",
+    }
+  );
+  assert.equal(res.status, 1, `expected exit 1, got ${res.status}\n${res.stdout}${res.stderr}`);
+  const payload = JSON.parse(res.stdout);
+  assert.equal(payload.failed, true);
+  assert.equal(payload.counts.shutdown, 2);
+  assert.equal(payload.matches.length, 2);
+  assert.equal(payload.matches[0].model, "gpt-4-0314");
+});
+
+check("CLI --sarif outputs valid SARIF 2.1.0 report", () => {
+  const res = spawnSync(
+    process.execPath,
+    [
+      entry,
+      "--sarif",
+      "--root",
+      path.join(fixtures, "project-shutdown"),
+      "--deprecations-url",
+      depPath,
+      "--releases-url",
+      relPath,
+    ],
+    {
+      env: { PATH: process.env.PATH },
+      encoding: "utf8",
+    }
+  );
+  assert.equal(res.status, 1, `expected exit 1, got ${res.status}\n${res.stdout}${res.stderr}`);
+  const sarif = JSON.parse(res.stdout);
+  assert.equal(sarif.version, "2.1.0");
+  assert.equal(sarif.runs[0].tool.driver.name, "ai-model-deprecation-check");
+  assert.equal(sarif.runs[0].results.length, 2);
+  assert.equal(sarif.runs[0].results[0].level, "error");
+});
+
+check("snapshot deprecation does not broaden to bare family name via model_slug", async () => {
+  const { extractIdCandidates } = await import("../dist/index.js");
+  const relMap = buildReleasesIndex([{ slug: "openai-gpt-4", name: "GPT-4" }]);
+  const snapshotCandidates = extractIdCandidates(
+    { model_name: "gpt-4-0314", model_slug: "openai-gpt-4" },
+    relMap
+  );
+  assert.deepEqual(snapshotCandidates, ["gpt-4-0314", "openai-gpt-4"]);
 });
 
 console.log("\nAll tests passed.");
