@@ -31,6 +31,9 @@ npx github:The-Flash-Report/ai-model-deprecation-check \
 # Machine-readable JSON or SARIF 2.1.0 output for scripts, IDEs, or GitHub Code Scanning
 npx github:The-Flash-Report/ai-model-deprecation-check --json
 npx github:The-Flash-Report/ai-model-deprecation-check --sarif
+
+# Model Context Protocol (MCP) stdio server for AI coding agents
+npx github:The-Flash-Report/ai-model-deprecation-check --mcp
 ```
 
 Supported CLI flags:
@@ -40,6 +43,7 @@ Supported CLI flags:
 - `--ignore-models <models>`: Comma-separated model IDs or slugs to skip.
 - `--root <dir>`: Repository directory to scan (default: current working directory).
 - `--format <actions|text|json|sarif>`, `--json`, or `--sarif`: Output format (defaults to `text` in terminals and `actions` inside GitHub Actions).
+- `--mcp`: Run as a Model Context Protocol (MCP) JSON-RPC 2.0 stdio server exposing `check_model_ids` and `scan_repository` tools.
 - `-h`, `--help`: Print CLI usage and exit.
 
 ## GitHub Action Quick Start
