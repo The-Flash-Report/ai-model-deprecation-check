@@ -28,8 +28,9 @@ npx github:The-Flash-Report/ai-model-deprecation-check \
   --paths "src/**,config/**" \
   --ignore-models "dall-e-2"
 
-# Machine-readable JSON output for scripts or custom CI checks
+# Machine-readable JSON or SARIF 2.1.0 output for scripts, IDEs, or GitHub Code Scanning
 npx github:The-Flash-Report/ai-model-deprecation-check --json
+npx github:The-Flash-Report/ai-model-deprecation-check --sarif
 ```
 
 Supported CLI flags:
@@ -37,7 +38,8 @@ Supported CLI flags:
 - `--fail-on <expiring|shutdown|never>`: When to exit non-zero (default: `expiring`).
 - `--paths <globs>`: Comma-separated glob patterns to scan.
 - `--ignore-models <models>`: Comma-separated model IDs or slugs to skip.
-- `--format <actions|text|json>` or `--json`: Output format (defaults to `text` in terminals and `actions` inside GitHub Actions).
+- `--root <dir>`: Repository directory to scan (default: current working directory).
+- `--format <actions|text|json|sarif>`, `--json`, or `--sarif`: Output format (defaults to `text` in terminals and `actions` inside GitHub Actions).
 - `-h`, `--help`: Print CLI usage and exit.
 
 ## GitHub Action Quick Start

@@ -24,10 +24,12 @@ Options:
   --fail-on <mode>            When to fail: expiring | shutdown | never (default: expiring)
   --paths <globs>             Comma-separated glob patterns to scan (default: entire repo)
   --ignore-models <models>    Comma-separated model IDs or slugs to ignore
+  --root <dir>                Repository directory to scan (default: current directory)
   --deprecations-url <src>    Override deprecations dataset URL or file path
   --releases-url <src>        Override model releases dataset URL or file path
-  --format <fmt>              Output format: actions | text | json
+  --format <fmt>              Output format: actions | text | json | sarif
   --json                      Shorthand for --format json
+  --sarif                     Shorthand for --format sarif (SARIF 2.1.0)
   -h, --help                  Show this help message and exit
 `;
 
@@ -55,6 +57,10 @@ function parseCliArgs(argv = []) {
       out.format = "json";
       continue;
     }
+    if (arg === "--sarif") {
+      out.format = "sarif";
+      continue;
+    }
     if (!arg.startsWith("--")) continue;
     const eqIdx = arg.indexOf("=");
     let key;
@@ -78,6 +84,9 @@ function parseCliArgs(argv = []) {
         break;
       case "ignore-models":
         out.ignoreModels = val;
+        break;
+      case "root":
+        out.root = val;
         break;
       case "deprecations-url":
         out.deprecationsUrl = val;
@@ -146,17 +155,24 @@ function looksLikeModelId(token) {
 function extractIdCandidates(row, releasesBySlug) {
   const out = new Set();
   const name = (row.model_name || "").trim();
+  let hasNameId = false;
   if (name) {
     const first = name.split(/\s+/)[0].replace(/[,()]+$/g, "");
-    if (looksLikeModelId(first)) out.add(first.toLowerCase());
+    if (looksLikeModelId(first)) {
+      out.add(first.toLowerCase());
+      hasNameId = true;
+    }
   }
   if (row.model_slug && looksLikeModelId(row.model_slug)) {
     out.add(row.model_slug.toLowerCase());
-    // Alias the slug back to the released model's canonical ID, e.g.
-    // slug openai-gpt-4 -> release name gpt-4.
-    const release = releasesBySlug.get(row.model_slug.toLowerCase());
-    if (release && looksLikeModelId(release.name)) {
-      out.add(release.name.toLowerCase());
+    // When model_name is prose rather than a concrete machine ID, fall back to
+    // the released model's canonical ID via releasesBySlug. Do not broaden a
+    // specific dated snapshot (e.g. gpt-4-0314) to a bare family name (gpt-4).
+    if (!hasNameId) {
+      const release = releasesBySlug.get(row.model_slug.toLowerCase());
+      if (release && looksLikeModelId(release.name)) {
+        out.add(release.name.toLowerCase());
+      }
     }
   }
   return [...out];
@@ -217,13 +233,15 @@ function escapeRegex(s) {
 
 // Exact-token matching with strict boundaries: the ID must not be preceded or
 // followed by another identifier character, so "gpt-4" in the dataset never
-// matches inside "gpt-4o" or "gpt-4-turbo" in caller code.
+// matches inside "gpt-4o" or "gpt-4-turbo" in caller code. Matching is
+// case-sensitive (lowercase machine IDs) so capitalized prose like "GPT-4 family"
+// in documentation or marketing copy is not flagged as an API model string.
 function buildMatcher(idToRow) {
   const ids = [...idToRow.keys()].sort((a, b) => b.length - a.length);
   if (ids.length === 0) return null;
   const pattern =
     "(?<![A-Za-z0-9._-])(?:" + ids.map(escapeRegex).join("|") + ")(?![A-Za-z0-9._-])";
-  return new RegExp(pattern, "gi");
+  return new RegExp(pattern, "g");
 }
 
 // ---------------------------------------------------------------------------
@@ -245,6 +263,18 @@ const SKIP_DIRS = new Set([
   ".hg",
   ".idea",
   ".vscode",
+  ".astro",
+  ".next",
+  ".nuxt",
+  ".svelte-kit",
+  ".wrangler",
+  ".netlify",
+  ".vercel",
+  ".turbo",
+  ".cache",
+  ".parcel-cache",
+  ".worktrees",
+  "coverage",
 ]);
 
 const SKIP_FILES = new Set([
@@ -299,6 +329,27 @@ function globToRegExp(glob) {
   return new RegExp("^" + re + "$");
 }
 
+function canDirMatchAnyPattern(relDir, pathPatterns) {
+  if (pathPatterns.length === 0) return true;
+  const dirParts = relDir.split("/");
+  for (const raw of pathPatterns) {
+    const patParts = raw.replace(/\\/g, "/").replace(/^\/+/, "").split("/");
+    let possible = true;
+    for (let i = 0; i < dirParts.length && i < patParts.length; i++) {
+      const pp = patParts[i];
+      if (pp === "**") break;
+      if (!globToRegExp(pp).test(dirParts[i])) {
+        possible = false;
+        break;
+      }
+    }
+    if (!possible) continue;
+    if (dirParts.length >= patParts.length && !patParts.includes("**")) continue;
+    return true;
+  }
+  return false;
+}
+
 function listFiles(root, pathPatterns) {
   const patterns = pathPatterns.map(globToRegExp);
   const results = [];
@@ -314,14 +365,16 @@ function listFiles(root, pathPatterns) {
     for (const entry of entries) {
       const full = path.join(dir, entry.name);
       if (entry.isSymbolicLink()) continue;
+      const rel = path.relative(root, full).split(path.sep).join("/");
       if (entry.isDirectory()) {
-        if (!SKIP_DIRS.has(entry.name.toLowerCase())) stack.push(full);
+        if (!SKIP_DIRS.has(entry.name.toLowerCase()) && canDirMatchAnyPattern(rel, pathPatterns)) {
+          stack.push(full);
+        }
         continue;
       }
       if (!entry.isFile()) continue;
       if (SKIP_FILES.has(entry.name.toLowerCase())) continue;
       if (BINARY_EXTENSIONS.has(path.extname(entry.name).toLowerCase())) continue;
-      const rel = path.relative(root, full).split(path.sep).join("/");
       if (patterns.length > 0 && !patterns.some((p) => p.test(rel))) continue;
       results.push({ full, rel });
     }
@@ -397,11 +450,16 @@ function escapeAnnotation(msg) {
   return msg.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 }
 
+function unwrapEnvelope(val) {
+  if (val && typeof val === "object" && "value" in val) return val.value;
+  return val;
+}
+
 function extractPricePair(rel) {
   if (!rel || typeof rel !== "object") return null;
   const p = rel.pricing && typeof rel.pricing === "object" ? rel.pricing : {};
-  const rawIn = p.input_per_mtok ?? rel.input_price_per_m ?? p.input ?? null;
-  const rawOut = p.output_per_mtok ?? rel.output_price_per_m ?? p.output ?? null;
+  const rawIn = unwrapEnvelope(p.input_per_mtok ?? rel.input_price_per_m ?? p.input ?? null);
+  const rawOut = unwrapEnvelope(p.output_per_mtok ?? rel.output_price_per_m ?? p.output ?? null);
   if (rawIn === null || rawIn === undefined || rawOut === null || rawOut === undefined) {
     return null;
   }
@@ -417,13 +475,14 @@ function extractPricePair(rel) {
 }
 
 function formatContextWindow(ctx) {
-  if (ctx === null || ctx === undefined || ctx === "") return null;
-  if (typeof ctx === "number") {
-    if (ctx >= 1000000) return `${+(ctx / 1000000).toFixed(1)}M tokens`;
-    if (ctx >= 1000) return `${Math.round(ctx / 1000)}K tokens`;
-    return `${ctx} tokens`;
+  const raw = unwrapEnvelope(ctx);
+  if (raw === null || raw === undefined || raw === "") return null;
+  if (typeof raw === "number") {
+    if (raw >= 1000000) return `${+(raw / 1000000).toFixed(1)}M tokens`;
+    if (raw >= 1000) return `${Math.round(raw / 1000)}K tokens`;
+    return `${raw} tokens`;
   }
-  return String(ctx).trim();
+  return String(raw).trim();
 }
 
 function replacementMeta(row, releasesBySlug) {
@@ -504,6 +563,56 @@ function isActionsEnv() {
   );
 }
 
+function buildSarifReport(report) {
+  const rules = [];
+  const results = [];
+  for (const item of report) {
+    const ruleId = `ai-model-deprecation/${item.model}`;
+    rules.push({
+      id: ruleId,
+      name: `DeprecatedModel_${item.model.replace(/[^a-zA-Z0-9_]/g, "_")}`,
+      shortDescription: {
+        text: `${item.provider} model "${item.model}" is ${item.level} (${item.shutdown_at || "TBA"})`,
+      },
+      helpUri: item.source_url || "https://aiflashreport.com/deprecations/",
+    });
+    const sarifLevel = item.level === "announced" ? "warning" : "error";
+    for (const loc of item.locations) {
+      results.push({
+        ruleId,
+        level: sarifLevel,
+        message: {
+          text: item.message,
+        },
+        locations: [
+          {
+            physicalLocation: {
+              artifactLocation: { uri: loc.file },
+              region: { startLine: loc.line, startColumn: loc.column },
+            },
+          },
+        ],
+      });
+    }
+  }
+  return {
+    $schema: "https://json.schemastore.org/sarif-2.1.0.json",
+    version: "2.1.0",
+    runs: [
+      {
+        tool: {
+          driver: {
+            name: "ai-model-deprecation-check",
+            informationUri: "https://github.com/The-Flash-Report/ai-model-deprecation-check",
+            rules,
+          },
+        },
+        results,
+      },
+    ],
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Main / Run
 // ---------------------------------------------------------------------------
@@ -525,13 +634,14 @@ async function run(options = {}) {
   const deprecationsUrl = options.deprecationsUrl ?? getInput("deprecations-url", DEFAULT_DEPRECATIONS_URL);
   const releasesUrl = options.releasesUrl ?? getInput("releases-url", DEFAULT_RELEASES_URL);
   const format = (options.format || "actions").toLowerCase();
-  if (!["actions", "text", "json"].includes(format)) {
-    throw new Error("format must be one of: actions, text, json");
+  if (!["actions", "text", "json", "sarif"].includes(format)) {
+    throw new Error("format must be one of: actions, text, json, sarif");
   }
+  const isStructured = format === "json" || format === "sarif";
   const root = path.resolve(options.root || process.env.GITHUB_WORKSPACE || process.cwd());
   const now = options.now instanceof Date ? options.now : new Date();
 
-  if (format !== "json") {
+  if (!isStructured) {
     console.log(`Scanning ${root} against the AI Flash Report deprecation dataset...`);
   }
 
@@ -552,12 +662,12 @@ async function run(options = {}) {
   const releasesBySlug = buildReleasesIndex(releasesList);
   const idToRow = buildMatchIndex(deprecations, releasesList, ignoreModels);
   const matcher = buildMatcher(idToRow);
-  if (format !== "json") {
+  if (!isStructured) {
     console.log(`Watching for ${idToRow.size} deprecated model identifiers (${deprecations.length} dataset rows).`);
   }
 
   const files = matcher ? listFiles(root, pathPatterns) : [];
-  if (format !== "json") {
+  if (!isStructured) {
     console.log(`Scanning ${files.length} text file(s). All matching is local; nothing about this repository is sent anywhere.`);
   }
 
@@ -603,6 +713,7 @@ async function run(options = {}) {
       previous_pricing: meta?.previous_pricing || null,
       replacement_context_window: meta?.context_window || null,
       source_url: row.source_url || null,
+      message,
       locations,
     });
   }
@@ -629,6 +740,8 @@ async function run(options = {}) {
         2
       )
     );
+  } else if (format === "sarif") {
+    console.log(JSON.stringify(buildSarifReport(report), null, 2));
   } else {
     // Step summary
     let summary = "## AI Model Deprecation Check\n\n";
@@ -703,5 +816,6 @@ export {
   parseCliArgs,
   replacementMeta,
   replacementText,
+  buildSarifReport,
   run,
 };
