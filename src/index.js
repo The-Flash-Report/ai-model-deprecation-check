@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // AI Model Deprecation Check
 // Scans the repository for AI model identifiers and checks them against the
 // public AI Flash Report deprecation dataset. All matching happens locally on
@@ -16,8 +17,22 @@ const DEFAULT_RELEASES_URL = "https://aiflashreport.com/data/model_releases.json
 const FOOTER =
   "Data: AI Flash Report deprecation tracker - https://aiflashreport.com/deprecations/ · weekly email alerts: https://aiflashreport.com/changes/";
 
+const USAGE = `Usage: ai-model-deprecation-check [options]
+
+Options:
+  --warn-days <days>          Fail if a matched model shuts down within N days (default: 90)
+  --fail-on <mode>            When to fail: expiring | shutdown | never (default: expiring)
+  --paths <globs>             Comma-separated glob patterns to scan (default: entire repo)
+  --ignore-models <models>    Comma-separated model IDs or slugs to ignore
+  --deprecations-url <src>    Override deprecations dataset URL or file path
+  --releases-url <src>        Override model releases dataset URL or file path
+  --format <fmt>              Output format: actions | text | json
+  --json                      Shorthand for --format json
+  -h, --help                  Show this help message and exit
+`;
+
 // ---------------------------------------------------------------------------
-// Inputs (provided by the runner as INPUT_* environment variables)
+// Inputs (CLI flags + GitHub Actions INPUT_* environment variables)
 // ---------------------------------------------------------------------------
 
 function getInput(name, fallback = "") {
@@ -26,6 +41,58 @@ function getInput(name, fallback = "") {
   const upper = name.replace(/ /g, "_").toUpperCase();
   const value = process.env["INPUT_" + upper] ?? process.env["INPUT_" + upper.replace(/-/g, "_")];
   return value === undefined || value === "" ? fallback : value.trim();
+}
+
+function parseCliArgs(argv = []) {
+  const out = {};
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === "-h" || arg === "--help") {
+      out.help = true;
+      continue;
+    }
+    if (arg === "--json") {
+      out.format = "json";
+      continue;
+    }
+    if (!arg.startsWith("--")) continue;
+    const eqIdx = arg.indexOf("=");
+    let key;
+    let val;
+    if (eqIdx !== -1) {
+      key = arg.slice(2, eqIdx);
+      val = arg.slice(eqIdx + 1);
+    } else {
+      key = arg.slice(2);
+      val = argv[i + 1] !== undefined && !argv[i + 1].startsWith("--") ? argv[++i] : "";
+    }
+    switch (key) {
+      case "warn-days":
+        out.warnDays = val;
+        break;
+      case "fail-on":
+        out.failOn = val;
+        break;
+      case "paths":
+        out.paths = val;
+        break;
+      case "ignore-models":
+        out.ignoreModels = val;
+        break;
+      case "deprecations-url":
+        out.deprecationsUrl = val;
+        break;
+      case "releases-url":
+        out.releasesUrl = val;
+        break;
+      case "format":
+        out.format = val.toLowerCase();
+        break;
+      default:
+        throw new Error(`Unknown CLI option: --${key}`);
+    }
+  }
+  return out;
 }
 
 function splitList(raw) {
@@ -95,13 +162,18 @@ function extractIdCandidates(row, releasesBySlug) {
   return [...out];
 }
 
-function buildMatchIndex(deprecations, releases, ignoreModels) {
+function buildReleasesIndex(releases) {
   const releasesBySlug = new Map();
   for (const rel of releases) {
     if (rel && rel.slug && rel.name) {
       releasesBySlug.set(String(rel.slug).toLowerCase(), rel);
     }
   }
+  return releasesBySlug;
+}
+
+function buildMatchIndex(deprecations, releases, ignoreModels) {
+  const releasesBySlug = buildReleasesIndex(releases);
 
   const ignore = new Set(ignoreModels.map((m) => m.toLowerCase()));
   const idToRow = new Map();
@@ -325,16 +397,76 @@ function escapeAnnotation(msg) {
   return msg.replace(/%/g, "%25").replace(/\r/g, "%0D").replace(/\n/g, "%0A");
 }
 
-function replacementText(row) {
+function extractPricePair(rel) {
+  if (!rel || typeof rel !== "object") return null;
+  const p = rel.pricing && typeof rel.pricing === "object" ? rel.pricing : {};
+  const rawIn = p.input_per_mtok ?? rel.input_price_per_m ?? p.input ?? null;
+  const rawOut = p.output_per_mtok ?? rel.output_price_per_m ?? p.output ?? null;
+  if (rawIn === null || rawIn === undefined || rawOut === null || rawOut === undefined) {
+    return null;
+  }
+  const fmt = (v) => {
+    if (typeof v === "number") return `$${v.toFixed(2)}`;
+    const s = String(v).trim().replace(/\/\s*1?M.*$/i, "");
+    return s.startsWith("$") ? s : `$${s}`;
+  };
+  const inStr = fmt(rawIn);
+  const outStr = fmt(rawOut);
+  if (inStr === "$0.00" && outStr === "$0.00") return null;
+  return `${inStr}/${outStr}`;
+}
+
+function formatContextWindow(ctx) {
+  if (ctx === null || ctx === undefined || ctx === "") return null;
+  if (typeof ctx === "number") {
+    if (ctx >= 1000000) return `${+(ctx / 1000000).toFixed(1)}M tokens`;
+    if (ctx >= 1000) return `${Math.round(ctx / 1000)}K tokens`;
+    return `${ctx} tokens`;
+  }
+  return String(ctx).trim();
+}
+
+function replacementMeta(row, releasesBySlug) {
+  if (!releasesBySlug || !row.replacement_slug) return null;
+  const replRel = releasesBySlug.get(String(row.replacement_slug).toLowerCase());
+  if (!replRel) return null;
+  const oldRel = row.model_slug
+    ? releasesBySlug.get(String(row.model_slug).toLowerCase())
+    : null;
+  const replPrice = extractPricePair(replRel);
+  const oldPrice = extractPricePair(oldRel);
+  const ctx = formatContextWindow(replRel.context_window);
+  const notes = [];
+  if (oldPrice && replPrice && oldPrice !== replPrice) {
+    notes.push(`pricing: ${oldPrice} -> ${replPrice} per 1M in/out`);
+  } else if (replPrice) {
+    notes.push(`pricing: ${replPrice} per 1M in/out`);
+  }
+  if (ctx) {
+    notes.push(`context: ${ctx}`);
+  }
+  return {
+    text: notes.length > 0 ? notes.join(", ") : null,
+    pricing: replPrice ? `${replPrice} per 1M in/out` : null,
+    previous_pricing: oldPrice ? `${oldPrice} per 1M in/out` : null,
+    context_window: ctx,
+  };
+}
+
+function replacementText(row, releasesBySlug) {
   if (!hasUsableReplacementName(row)) return "no replacement listed";
   let text = `replacement: ${row.replacement_name}`;
   if (row.replacement_slug) {
     text += ` (https://aiflashreport.com/models/${row.replacement_slug}/)`;
   }
+  const meta = replacementMeta(row, releasesBySlug);
+  if (meta && meta.text) {
+    text += ` [${meta.text}]`;
+  }
   return text;
 }
 
-function describe(id, row, level, warnDays, now) {
+function describe(id, row, level, warnDays, now, releasesBySlug) {
   const parts = [];
   if (level === "shutdown") {
     parts.push(`"${id}" (${row.provider}) was shut down${row.shutdown_at ? ` on ${row.shutdown_at}` : ""}.`);
@@ -344,7 +476,7 @@ function describe(id, row, level, warnDays, now) {
   } else {
     parts.push(`"${id}" (${row.provider}) is deprecated${row.shutdown_at ? `; shutdown scheduled for ${row.shutdown_at}` : ""}.`);
   }
-  parts.push(replacementText(row));
+  parts.push(replacementText(row, releasesBySlug));
   if (row.source_url) parts.push(`source: ${row.source_url}`);
   return parts.join(" ");
 }
@@ -363,43 +495,71 @@ function setOutput(name, value) {
   appendFileSafe("GITHUB_OUTPUT", `${name}<<__EOF__\n${value}\n__EOF__\n`);
 }
 
+function isActionsEnv() {
+  return (
+    process.env.GITHUB_ACTIONS === "true" ||
+    Boolean(process.env.GITHUB_OUTPUT) ||
+    Boolean(process.env.GITHUB_STEP_SUMMARY) ||
+    Object.keys(process.env).some((k) => k.startsWith("INPUT_"))
+  );
+}
+
 // ---------------------------------------------------------------------------
-// Main
+// Main / Run
 // ---------------------------------------------------------------------------
 
-async function main() {
-  const warnDays = parseInt(getInput("warn-days", "90"), 10);
+async function run(options = {}) {
+  const rawWarnDays = options.warnDays ?? getInput("warn-days", "90");
+  const warnDays = parseInt(String(rawWarnDays), 10);
   if (Number.isNaN(warnDays) || warnDays < 0) {
     throw new Error("warn-days must be a non-negative integer");
   }
-  const failOn = getInput("fail-on", "expiring").toLowerCase();
+  const failOn = String(options.failOn ?? getInput("fail-on", "expiring")).toLowerCase();
   if (!["expiring", "shutdown", "never"].includes(failOn)) {
-    throw new Error('fail-on must be one of: expiring, shutdown, never');
+    throw new Error("fail-on must be one of: expiring, shutdown, never");
   }
-  const pathPatterns = splitList(getInput("paths", ""));
-  const ignoreModels = splitList(getInput("ignore-models", ""));
-  const deprecationsUrl = getInput("deprecations-url", DEFAULT_DEPRECATIONS_URL);
-  const releasesUrl = getInput("releases-url", DEFAULT_RELEASES_URL);
-  const root = path.resolve(process.env.GITHUB_WORKSPACE || process.cwd());
-  const now = new Date();
+  const rawPaths = options.paths ?? getInput("paths", "");
+  const pathPatterns = Array.isArray(rawPaths) ? rawPaths : splitList(String(rawPaths));
+  const rawIgnore = options.ignoreModels ?? getInput("ignore-models", "");
+  const ignoreModels = Array.isArray(rawIgnore) ? rawIgnore : splitList(String(rawIgnore));
+  const deprecationsUrl = options.deprecationsUrl ?? getInput("deprecations-url", DEFAULT_DEPRECATIONS_URL);
+  const releasesUrl = options.releasesUrl ?? getInput("releases-url", DEFAULT_RELEASES_URL);
+  const format = (options.format || "actions").toLowerCase();
+  if (!["actions", "text", "json"].includes(format)) {
+    throw new Error("format must be one of: actions, text, json");
+  }
+  const root = path.resolve(options.root || process.env.GITHUB_WORKSPACE || process.cwd());
+  const now = options.now instanceof Date ? options.now : new Date();
 
-  console.log(`Scanning ${root} against the AI Flash Report deprecation dataset...`);
+  if (format !== "json") {
+    console.log(`Scanning ${root} against the AI Flash Report deprecation dataset...`);
+  }
 
   const [deprecations, releases] = await Promise.all([
     loadJson(deprecationsUrl),
     loadJson(releasesUrl).catch((err) => {
-      console.log(`::warning::Could not load model releases dataset (${err.message}); slug aliasing disabled.`);
+      if (format === "actions") {
+        console.log(`::warning::Could not load model releases dataset (${err.message}); slug aliasing disabled.`);
+      } else if (format === "text") {
+        console.warn(`Warning: Could not load model releases dataset (${err.message}); slug aliasing disabled.`);
+      }
       return [];
     }),
   ]);
   if (!Array.isArray(deprecations)) throw new Error("Deprecations dataset is not an array");
 
-  const idToRow = buildMatchIndex(deprecations, Array.isArray(releases) ? releases : [], ignoreModels);
+  const releasesList = Array.isArray(releases) ? releases : [];
+  const releasesBySlug = buildReleasesIndex(releasesList);
+  const idToRow = buildMatchIndex(deprecations, releasesList, ignoreModels);
   const matcher = buildMatcher(idToRow);
-  console.log(`Watching for ${idToRow.size} deprecated model identifiers (${deprecations.length} dataset rows).`);
+  if (format !== "json") {
+    console.log(`Watching for ${idToRow.size} deprecated model identifiers (${deprecations.length} dataset rows).`);
+  }
 
   const files = matcher ? listFiles(root, pathPatterns) : [];
-  console.log(`Scanning ${files.length} text file(s). All matching is local; nothing about this repository is sent anywhere.`);
+  if (format !== "json") {
+    console.log(`Scanning ${files.length} text file(s). All matching is local; nothing about this repository is sent anywhere.`);
+  }
 
   const hits = matcher ? scan(files, matcher, idToRow) : new Map();
 
@@ -408,16 +568,26 @@ async function main() {
   for (const [id, { row, locations }] of [...hits.entries()].sort()) {
     const level = classify(row, warnDays, now);
     counts[level]++;
-    const message = describe(id, row, level, warnDays, now);
+    const message = describe(id, row, level, warnDays, now, releasesBySlug);
+    const meta = replacementMeta(row, releasesBySlug);
     const failing = level === "shutdown" || (level === "expiring" && failOn === "expiring");
     const command = failing && failOn !== "never" ? "error" : "warning";
-    for (const loc of locations.slice(0, 10)) {
-      console.log(
-        `::${command} file=${loc.file},line=${loc.line},col=${loc.column},title=AI model deprecation::${escapeAnnotation(message)}`
-      );
-    }
-    if (locations.length > 10) {
-      console.log(`(${locations.length - 10} more location(s) for "${id}" not annotated)`);
+    if (format === "actions") {
+      for (const loc of locations.slice(0, 10)) {
+        console.log(
+          `::${command} file=${loc.file},line=${loc.line},col=${loc.column},title=AI model deprecation::${escapeAnnotation(message)}`
+        );
+      }
+      if (locations.length > 10) {
+        console.log(`(${locations.length - 10} more location(s) for "${id}" not annotated)`);
+      }
+    } else if (format === "text") {
+      for (const loc of locations.slice(0, 10)) {
+        console.log(`[${command.toUpperCase()}] ${loc.file}:${loc.line}:${loc.column} - ${message}`);
+      }
+      if (locations.length > 10) {
+        console.log(`(${locations.length - 10} more location(s) for "${id}" not shown)`);
+      }
     }
     report.push({
       model: id,
@@ -429,39 +599,13 @@ async function main() {
       replacement_url: row.replacement_slug
         ? `https://aiflashreport.com/models/${row.replacement_slug}/`
         : null,
+      replacement_pricing: meta?.pricing || null,
+      previous_pricing: meta?.previous_pricing || null,
+      replacement_context_window: meta?.context_window || null,
       source_url: row.source_url || null,
       locations,
     });
   }
-
-  // Step summary
-  let summary = "## AI Model Deprecation Check\n\n";
-  if (report.length === 0) {
-    summary += "No deprecated model identifiers found.\n";
-    console.log("No deprecated model identifiers found.");
-  } else {
-    summary += "| Model | Provider | Status | Shutdown | Replacement | Locations |\n";
-    summary += "|---|---|---|---|---|---|\n";
-    for (const r of report) {
-      const repl = r.replacement_name
-        ? (r.replacement_url ? `[${r.replacement_name}](${r.replacement_url})` : r.replacement_name)
-        : "none listed";
-      const status = r.source_url ? `[${r.level}](${r.source_url})` : r.level;
-      summary += `| \`${r.model}\` | ${r.provider} | ${status} | ${r.shutdown_at || "TBA"} | ${repl} | ${r.locations.length} |\n`;
-    }
-    console.log(
-      `Found ${report.length} deprecated model(s): ${counts.shutdown} shut down, ${counts.expiring} shutting down within ${warnDays} days, ${counts.announced} announced.`
-    );
-  }
-  summary += `\n${FOOTER}\n`;
-  appendFileSafe("GITHUB_STEP_SUMMARY", summary);
-
-  setOutput("shutdown-count", String(counts.shutdown));
-  setOutput("expiring-count", String(counts.expiring));
-  setOutput("announced-count", String(counts.announced));
-  setOutput("matches", JSON.stringify(report));
-
-  console.log(FOOTER);
 
   const shouldFail =
     failOn === "never"
@@ -469,12 +613,73 @@ async function main() {
       : failOn === "shutdown"
         ? counts.shutdown > 0
         : counts.shutdown > 0 || counts.expiring > 0;
-  if (shouldFail) {
+
+  if (format === "json") {
     console.log(
-      `::error::${counts.shutdown + counts.expiring} model(s) are shut down or shutting down within ${warnDays} days. See annotations above for replacements.`
+      JSON.stringify(
+        {
+          root,
+          warn_days: warnDays,
+          fail_on: failOn,
+          failed: shouldFail,
+          counts,
+          matches: report,
+        },
+        null,
+        2
+      )
     );
+  } else {
+    // Step summary
+    let summary = "## AI Model Deprecation Check\n\n";
+    if (report.length === 0) {
+      summary += "No deprecated model identifiers found.\n";
+      console.log("No deprecated model identifiers found.");
+    } else {
+      summary += "| Model | Provider | Status | Shutdown | Replacement | Locations |\n";
+      summary += "|---|---|---|---|---|---|\n";
+      for (const r of report) {
+        const repl = r.replacement_name
+          ? (r.replacement_url ? `[${r.replacement_name}](${r.replacement_url})` : r.replacement_name)
+          : "none listed";
+        const status = r.source_url ? `[${r.level}](${r.source_url})` : r.level;
+        summary += `| \`${r.model}\` | ${r.provider} | ${status} | ${r.shutdown_at || "TBA"} | ${repl} | ${r.locations.length} |\n`;
+      }
+      console.log(
+        `Found ${report.length} deprecated model(s): ${counts.shutdown} shut down, ${counts.expiring} shutting down within ${warnDays} days, ${counts.announced} announced.`
+      );
+    }
+    summary += `\n${FOOTER}\n`;
+    appendFileSafe("GITHUB_STEP_SUMMARY", summary);
+
+    setOutput("shutdown-count", String(counts.shutdown));
+    setOutput("expiring-count", String(counts.expiring));
+    setOutput("announced-count", String(counts.announced));
+    setOutput("matches", JSON.stringify(report));
+
+    console.log(FOOTER);
+  }
+
+  if (shouldFail) {
+    if (format === "actions") {
+      console.log(
+        `::error::${counts.shutdown + counts.expiring} model(s) are shut down or shutting down within ${warnDays} days. See annotations above for replacements.`
+      );
+    }
     process.exitCode = 1;
   }
+
+  return { counts, matches: report, failed: shouldFail };
+}
+
+async function main(argv = process.argv.slice(2)) {
+  const cli = parseCliArgs(argv);
+  if (cli.help) {
+    process.stdout.write(USAGE);
+    return;
+  }
+  const format = cli.format || (isActionsEnv() ? "actions" : "text");
+  await run({ ...cli, format });
 }
 
 const isDirectRun =
@@ -490,8 +695,13 @@ if (isDirectRun) {
 export {
   looksLikeModelId,
   extractIdCandidates,
+  buildReleasesIndex,
   buildMatchIndex,
   buildMatcher,
   classify,
   globToRegExp,
+  parseCliArgs,
+  replacementMeta,
+  replacementText,
+  run,
 };

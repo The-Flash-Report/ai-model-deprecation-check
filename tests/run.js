@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildReleasesIndex, parseCliArgs, replacementText } from "../dist/index.js";
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const entry = path.join(root, "dist", "index.js");
@@ -192,6 +193,80 @@ check("paths input restricts the scan", () => {
   assert.equal(r.code, 1);
   assert.doesNotMatch(r.stdout, /app\.py/);
   assert.match(r.stdout, /notes\.md/);
+});
+
+check("parseCliArgs parses space-separated, equals-separated, and boolean flags", () => {
+  const parsed = parseCliArgs([
+    "--warn-days",
+    "60",
+    "--fail-on=shutdown",
+    "--ignore-models",
+    "gpt-4-0314,dall-e-2",
+    "--paths=src/**,config/**",
+    "--json",
+  ]);
+  assert.equal(parsed.warnDays, "60");
+  assert.equal(parsed.failOn, "shutdown");
+  assert.equal(parsed.ignoreModels, "gpt-4-0314,dall-e-2");
+  assert.equal(parsed.paths, "src/**,config/**");
+  assert.equal(parsed.format, "json");
+
+  const helpParsed = parseCliArgs(["--help"]);
+  assert.equal(helpParsed.help, true);
+});
+
+check("replacementText enriches replacement with pricing delta and context window when available", () => {
+  const enrichedReleases = buildReleasesIndex([
+    {
+      slug: "openai-gpt-4-0314",
+      name: "gpt-4-0314",
+      pricing: { input_per_mtok: "$30.00", output_per_mtok: "$60.00" },
+      context_window: "8K tokens",
+    },
+    {
+      slug: "openai-gpt-5",
+      name: "gpt-5",
+      pricing: { input_per_mtok: "$2.50", output_per_mtok: "$12.00" },
+      context_window: "400K tokens",
+    },
+  ]);
+  const text = replacementText(deprecations[0], enrichedReleases);
+  assert.match(text, /replacement: gpt-5 \(https:\/\/aiflashreport\.com\/models\/openai-gpt-5\/\)/);
+  assert.match(text, /pricing: \$30\.00\/\$60\.00 -> \$2\.50\/\$12\.00 per 1M in\/out/);
+  assert.match(text, /context: 400K tokens/);
+});
+
+check("CLI --help prints usage and exits 0", () => {
+  const res = spawnSync(process.execPath, [entry, "--help"], { encoding: "utf8" });
+  assert.equal(res.status, 0);
+  assert.match(res.stdout, /Usage: ai-model-deprecation-check \[options\]/);
+  assert.match(res.stdout, /--warn-days <days>/);
+  assert.match(res.stdout, /--json/);
+});
+
+check("CLI --json outputs structured JSON report and sets exit code", () => {
+  const res = spawnSync(
+    process.execPath,
+    [
+      entry,
+      "--json",
+      "--deprecations-url",
+      depPath,
+      "--releases-url",
+      relPath,
+    ],
+    {
+      cwd: path.join(fixtures, "project-shutdown"),
+      env: { PATH: process.env.PATH },
+      encoding: "utf8",
+    }
+  );
+  assert.equal(res.status, 1, `expected exit 1, got ${res.status}\n${res.stdout}${res.stderr}`);
+  const payload = JSON.parse(res.stdout);
+  assert.equal(payload.failed, true);
+  assert.equal(payload.counts.shutdown, 2);
+  assert.equal(payload.matches.length, 2);
+  assert.equal(payload.matches[0].model, "gpt-4-0314");
 });
 
 console.log("\nAll tests passed.");

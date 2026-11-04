@@ -1,6 +1,6 @@
 # AI Model Deprecation Check
 
-A GitHub Action that scans your repository for AI model identifiers (things like `gpt-4-0314`, `claude-3-opus-20240229`, `gemini-1.5-pro-002`) and checks them against a continuously updated public dataset of provider deprecations. It fails your CI when your code still references a model that has been shut down, or that shuts down soon, and tells you what to migrate to.
+A GitHub Action and zero-dependency CLI that scans your repository for AI model identifiers (things like `gpt-4-0314`, `claude-3-opus-20240229`, `gemini-1.5-pro-002`) and checks them against a continuously updated public dataset of provider deprecations. It fails your CI when your code still references a model that has been shut down, or that shuts down soon, and tells you what to migrate to (including replacement pricing deltas and context window specs when available).
 
 Providers retire models on their own schedule. This check turns "our staging environment broke because the model ID stopped resolving" into a red build with a named replacement, months before the shutdown date.
 
@@ -8,10 +8,39 @@ Providers retire models on their own schedule. This check turns "our staging env
 
 1. Fetches the public deprecation dataset from [aiflashreport.com](https://aiflashreport.com/deprecations/) (two anonymous HTTPS GETs, no auth).
 2. Scans your checkout locally for exact-token matches against the deprecated model IDs in that dataset.
-3. For every hit, annotates the exact file and line with the provider, the shutdown date, the suggested replacement (with a link to its model page), and the provider's own deprecation notice.
+3. For every hit, annotates the exact file and line with the provider, the shutdown date, the suggested replacement (with a link to its model page, plus per-1M-token pricing comparison and context window when available), and the provider's own deprecation notice.
 4. Fails the check if a matched model is already shut down or shuts down within the warning window (90 days by default). Announced deprecations further out produce warnings only.
 
-## Quick start
+## CLI Usage (`npx`)
+
+Run the scanner directly in any local repository or non-GitHub CI pipeline without installing dependencies:
+
+```bash
+npx github:The-Flash-Report/ai-model-deprecation-check
+```
+
+Pass CLI flags to customize the scan or emit structured JSON:
+
+```bash
+# Custom warning window, path filter, and ignored models
+npx github:The-Flash-Report/ai-model-deprecation-check \
+  --warn-days 120 \
+  --paths "src/**,config/**" \
+  --ignore-models "dall-e-2"
+
+# Machine-readable JSON output for scripts or custom CI checks
+npx github:The-Flash-Report/ai-model-deprecation-check --json
+```
+
+Supported CLI flags:
+- `--warn-days <days>`: Fail if a matched model shuts down within N days (default: `90`).
+- `--fail-on <expiring|shutdown|never>`: When to exit non-zero (default: `expiring`).
+- `--paths <globs>`: Comma-separated glob patterns to scan.
+- `--ignore-models <models>`: Comma-separated model IDs or slugs to skip.
+- `--format <actions|text|json>` or `--json`: Output format (defaults to `text` in terminals and `actions` inside GitHub Actions).
+- `-h`, `--help`: Print CLI usage and exit.
+
+## GitHub Action Quick Start
 
 ```yaml
 name: AI model deprecation check
