@@ -9,6 +9,7 @@
 
 import fs from "node:fs";
 import path from "node:path";
+import readline from "node:readline";
 import { pathToFileURL } from "node:url";
 
 const DEFAULT_DEPRECATIONS_URL = "https://aiflashreport.com/data/deprecations.json";
@@ -30,6 +31,7 @@ Options:
   --format <fmt>              Output format: actions | text | json | sarif
   --json                      Shorthand for --format json
   --sarif                     Shorthand for --format sarif (SARIF 2.1.0)
+  --mcp                       Run as a Model Context Protocol (MCP) JSON-RPC 2.0 stdio server
   -h, --help                  Show this help message and exit
 `;
 
@@ -59,6 +61,10 @@ function parseCliArgs(argv = []) {
     }
     if (arg === "--sarif") {
       out.format = "sarif";
+      continue;
+    }
+    if (arg === "--mcp") {
+      out.mcp = true;
       continue;
     }
     if (!arg.startsWith("--")) continue;
@@ -785,10 +791,218 @@ async function run(options = {}) {
   return { counts, matches: report, failed: shouldFail };
 }
 
+// ---------------------------------------------------------------------------
+// Model Context Protocol (MCP) JSON-RPC 2.0 Stdio Server
+// ---------------------------------------------------------------------------
+
+const MCP_TOOLS = [
+  {
+    name: "check_model_ids",
+    description:
+      "Check a text snippet, environment file, or list of AI model identifiers against the AI Flash Report deprecation dataset.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        text: {
+          type: "string",
+          description: "Code snippet, .env content, or whitespace-separated model IDs to check.",
+        },
+        warn_days: {
+          type: "number",
+          description: "Days before shutdown to flag as expiring (default: 90).",
+        },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "scan_repository",
+    description:
+      "Scan a local repository directory for deprecated or expiring AI model identifiers.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        root: {
+          type: "string",
+          description: "Directory path to scan (defaults to current working directory).",
+        },
+        warn_days: {
+          type: "number",
+          description: "Days before shutdown to flag as expiring (default: 90).",
+        },
+        paths: {
+          type: "string",
+          description: "Optional comma-separated glob patterns to scan.",
+        },
+        ignore_models: {
+          type: "string",
+          description: "Optional comma-separated model IDs or slugs to ignore.",
+        },
+      },
+    },
+  },
+];
+
+async function checkTextSnippet(text, options = {}) {
+  const warnDays = Number.isFinite(Number(options.warnDays)) ? Number(options.warnDays) : 90;
+  const deprecationsUrl = options.deprecationsUrl || DEFAULT_DEPRECATIONS_URL;
+  const releasesUrl = options.releasesUrl || DEFAULT_RELEASES_URL;
+  const now = options.now instanceof Date ? options.now : new Date();
+  const [deprecations, releases] = await Promise.all([
+    loadJson(deprecationsUrl),
+    loadJson(releasesUrl).catch(() => []),
+  ]);
+  const releasesList = Array.isArray(releases) ? releases : [];
+  const releasesBySlug = buildReleasesIndex(releasesList);
+  const idToRow = buildMatchIndex(deprecations, releasesList, []);
+  const matcher = buildMatcher(idToRow);
+  const matches = [];
+  if (matcher && text) {
+    const seen = new Set();
+    const lines = String(text).split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      matcher.lastIndex = 0;
+      let m;
+      while ((m = matcher.exec(lines[i])) !== null) {
+        const id = m[0].toLowerCase();
+        if (seen.has(id)) continue;
+        seen.add(id);
+        const row = idToRow.get(id);
+        if (!row) continue;
+        const level = classify(row, warnDays, now);
+        const meta = replacementMeta(row, releasesBySlug);
+        matches.push({
+          model: id,
+          provider: row.provider,
+          status: row.status,
+          level,
+          shutdown_at: row.shutdown_at || null,
+          replacement_name: hasUsableReplacementName(row) ? row.replacement_name : null,
+          replacement_pricing: meta?.pricing || null,
+          previous_pricing: meta?.previous_pricing || null,
+          replacement_context_window: meta?.context_window || null,
+          message: describe(id, row, level, warnDays, now, releasesBySlug),
+        });
+      }
+    }
+  }
+  return { warn_days: warnDays, matches };
+}
+
+async function handleMcpRequest(msg, defaultOpts = {}) {
+  if (!msg || typeof msg !== "object") return null;
+  const { id, method, params } = msg;
+  if (id === undefined || id === null) {
+    // Notification (e.g. notifications/initialized)
+    return null;
+  }
+  try {
+    if (method === "initialize") {
+      return {
+        jsonrpc: "2.0",
+        id,
+        result: {
+          protocolVersion: params?.protocolVersion || "2024-11-05",
+          capabilities: { tools: {} },
+          serverInfo: { name: "ai-model-deprecation-check", version: "1.1.0" },
+        },
+      };
+    }
+    if (method === "ping") {
+      return { jsonrpc: "2.0", id, result: {} };
+    }
+    if (method === "tools/list") {
+      return { jsonrpc: "2.0", id, result: { tools: MCP_TOOLS } };
+    }
+    if (method === "tools/call") {
+      const toolName = params?.name;
+      const args = params?.arguments || {};
+      if (toolName === "check_model_ids") {
+        const res = await checkTextSnippet(args.text || "", {
+          ...defaultOpts,
+          warnDays: args.warn_days ?? defaultOpts.warnDays ?? 90,
+        });
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: JSON.stringify(res, null, 2) }],
+          },
+        };
+      }
+      if (toolName === "scan_repository") {
+        const origLog = console.log;
+        let captured = "";
+        console.log = (out) => {
+          captured = String(out);
+        };
+        try {
+          await run({
+            ...defaultOpts,
+            root: args.root || defaultOpts.root || process.cwd(),
+            warnDays: args.warn_days ?? defaultOpts.warnDays ?? 90,
+            paths: args.paths ?? defaultOpts.paths ?? "",
+            ignoreModels: args.ignore_models ?? defaultOpts.ignoreModels ?? "",
+            failOn: "never",
+            format: "json",
+          });
+        } finally {
+          console.log = origLog;
+        }
+        return {
+          jsonrpc: "2.0",
+          id,
+          result: {
+            content: [{ type: "text", text: captured || "{}" }],
+          },
+        };
+      }
+      return {
+        jsonrpc: "2.0",
+        id,
+        error: { code: -32601, message: `Unknown tool: ${toolName}` },
+      };
+    }
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: `Method not found: ${method}` },
+    };
+  } catch (err) {
+    return {
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32603, message: err.message || String(err) },
+    };
+  }
+}
+
+async function runMcpServer(options = {}) {
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  for await (const line of rl) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    let msg;
+    try {
+      msg = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    const resp = await handleMcpRequest(msg, options);
+    if (resp) {
+      process.stdout.write(JSON.stringify(resp) + "\n");
+    }
+  }
+}
+
 async function main(argv = process.argv.slice(2)) {
   const cli = parseCliArgs(argv);
   if (cli.help) {
     process.stdout.write(USAGE);
+    return;
+  }
+  if (cli.mcp) {
+    await runMcpServer(cli);
     return;
   }
   const format = cli.format || (isActionsEnv() ? "actions" : "text");
@@ -817,5 +1031,7 @@ export {
   replacementMeta,
   replacementText,
   buildSarifReport,
+  handleMcpRequest,
+  runMcpServer,
   run,
 };

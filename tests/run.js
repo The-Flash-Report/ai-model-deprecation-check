@@ -310,4 +310,90 @@ check("snapshot deprecation does not broaden to bare family name via model_slug"
   assert.deepEqual(snapshotCandidates, ["gpt-4-0314", "openai-gpt-4"]);
 });
 
+check("MCP server handles initialize, tools/list, and tools/call over JSON-RPC 2.0 stdio", () => {
+  const inputLines = [
+    JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05" } }),
+    JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }),
+    JSON.stringify({ jsonrpc: "2.0", id: 2, method: "tools/list" }),
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 3,
+      method: "tools/call",
+      params: {
+        name: "check_model_ids",
+        arguments: { text: 'OPENAI_MODEL="gpt-4-0314"\nCLEAN="gpt-5"' },
+      },
+    }),
+  ].join("\n") + "\n";
+
+  const res = spawnSync(
+    process.execPath,
+    [
+      entry,
+      "--mcp",
+      "--deprecations-url",
+      depPath,
+      "--releases-url",
+      relPath,
+    ],
+    {
+      input: inputLines,
+      env: { PATH: process.env.PATH },
+      encoding: "utf8",
+    }
+  );
+  assert.equal(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}${res.stderr}`);
+  const responses = res.stdout
+    .trim()
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+  assert.equal(responses.length, 3);
+  assert.equal(responses[0].id, 1);
+  assert.equal(responses[0].result.serverInfo.name, "ai-model-deprecation-check");
+  assert.equal(responses[1].id, 2);
+  assert.equal(responses[1].result.tools.length, 2);
+  assert.equal(responses[2].id, 3);
+  const toolResult = JSON.parse(responses[2].result.content[0].text);
+  assert.equal(toolResult.matches.length, 1);
+  assert.equal(toolResult.matches[0].model, "gpt-4-0314");
+});
+
+check("MCP server scan_repository tool returns structured repo scan JSON", () => {
+  const inputLines = [
+    JSON.stringify({
+      jsonrpc: "2.0",
+      id: 10,
+      method: "tools/call",
+      params: {
+        name: "scan_repository",
+        arguments: { root: path.join(fixtures, "project-shutdown") },
+      },
+    }),
+  ].join("\n") + "\n";
+
+  const res = spawnSync(
+    process.execPath,
+    [
+      entry,
+      "--mcp",
+      "--deprecations-url",
+      depPath,
+      "--releases-url",
+      relPath,
+    ],
+    {
+      input: inputLines,
+      env: { PATH: process.env.PATH },
+      encoding: "utf8",
+    }
+  );
+  assert.equal(res.status, 0);
+  const resp = JSON.parse(res.stdout.trim());
+  assert.equal(resp.id, 10);
+  const scanPayload = JSON.parse(resp.result.content[0].text);
+  assert.equal(scanPayload.counts.shutdown, 2);
+  assert.equal(scanPayload.matches.length, 2);
+});
+
 console.log("\nAll tests passed.");
