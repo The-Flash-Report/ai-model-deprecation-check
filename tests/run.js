@@ -238,6 +238,21 @@ check("replacementText enriches replacement with pricing delta and context windo
   assert.match(text, /replacement: gpt-5 \(https:\/\/aiflashreport\.com\/models\/openai-gpt-5\/\)/);
   assert.match(text, /pricing: \$30\.00\/\$60\.00 -> \$2\.50\/\$12\.00 per 1M in\/out/);
   assert.match(text, /context: 400K tokens/);
+
+  // Row-level replacement_pricing + model_pricing fallback when replacement_slug is null
+  const unsluggedRow = {
+    provider: "OpenAI",
+    model_name: "gpt-4-32k",
+    model_slug: null,
+    replacement_name: "gpt-5.6-sol",
+    replacement_slug: null,
+    model_pricing: "$60.00/$120.00",
+    replacement_pricing: "$4.00/$20.00",
+    status: "shutdown",
+    shutdown_at: "2025-06-06",
+  };
+  const fallbackText = replacementText(unsluggedRow, new Map());
+  assert.match(fallbackText, /replacement: gpt-5\.6-sol \[pricing: \$60\.00\/\$120\.00 -> \$4\.00\/\$20\.00 per 1M in\/out\]/);
 });
 
 check("CLI --help prints usage and exits 0", () => {

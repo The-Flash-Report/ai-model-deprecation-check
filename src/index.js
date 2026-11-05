@@ -492,28 +492,41 @@ function formatContextWindow(ctx) {
 }
 
 function replacementMeta(row, releasesBySlug) {
-  if (!releasesBySlug || !row.replacement_slug) return null;
-  const replRel = releasesBySlug.get(String(row.replacement_slug).toLowerCase());
-  if (!replRel) return null;
-  const oldRel = row.model_slug
-    ? releasesBySlug.get(String(row.model_slug).toLowerCase())
-    : null;
-  const replPrice = extractPricePair(replRel);
-  const oldPrice = extractPricePair(oldRel);
-  const ctx = formatContextWindow(replRel.context_window);
+  if (!row) return null;
+  const replRel =
+    releasesBySlug && row.replacement_slug
+      ? releasesBySlug.get(String(row.replacement_slug).toLowerCase())
+      : null;
+  const oldRel =
+    releasesBySlug && row.model_slug
+      ? releasesBySlug.get(String(row.model_slug).toLowerCase())
+      : null;
+  const replPrice =
+    extractPricePair(replRel) ||
+    (typeof row.replacement_pricing === "string" && row.replacement_pricing.trim()
+      ? row.replacement_pricing.trim()
+      : null);
+  const oldPrice =
+    extractPricePair(oldRel) ||
+    (typeof row.model_pricing === "string" && row.model_pricing.trim()
+      ? row.model_pricing.trim()
+      : null);
+  const ctx = replRel ? formatContextWindow(replRel.context_window) : null;
+  if (!replPrice && !oldPrice && !ctx) return null;
+  const fmtUnit = (p) => (p && /\/|free/i.test(p) && !/^\$[\d.]+\/\$[\d.]+$/.test(p) ? p : `${p} per 1M in/out`);
   const notes = [];
   if (oldPrice && replPrice && oldPrice !== replPrice) {
-    notes.push(`pricing: ${oldPrice} -> ${replPrice} per 1M in/out`);
+    notes.push(`pricing: ${oldPrice} -> ${fmtUnit(replPrice)}`);
   } else if (replPrice) {
-    notes.push(`pricing: ${replPrice} per 1M in/out`);
+    notes.push(`pricing: ${fmtUnit(replPrice)}`);
   }
   if (ctx) {
     notes.push(`context: ${ctx}`);
   }
   return {
     text: notes.length > 0 ? notes.join(", ") : null,
-    pricing: replPrice ? `${replPrice} per 1M in/out` : null,
-    previous_pricing: oldPrice ? `${oldPrice} per 1M in/out` : null,
+    pricing: replPrice ? fmtUnit(replPrice) : null,
+    previous_pricing: oldPrice ? fmtUnit(oldPrice) : null,
     context_window: ctx,
   };
 }
